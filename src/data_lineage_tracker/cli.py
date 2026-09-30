@@ -10,12 +10,13 @@ Dataset references accept: full id, id prefix, ``name@version``, or a bare
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from . import graph
+from . import graph, report as report_mod, verify as verify_mod
 from .store import LineageError, LineageStore
 
 DEFAULT_DB = Path.home() / ".data-lineage-tracker" / "lineage.db"
@@ -191,6 +192,76 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Verify a file on disk against a registered dataset's recorded hashes."""
+    store = open_store(args)
+    try:
+        ds = store.resolve(args.ref)
+    except LineageError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    res = verify_mod.verify_dataset(store, ds.id, args.file)
+    print(f"{ds.name}@v{ds.version} vs {args.file}")
+    print(f"  status:      {res.status}")
+    print(f"  content:     {'MATCH' if res.content_ok else 'MISMATCH'}")
+    if res.schema_ok is not None:
+        print(f"  schema:      {'MATCH' if res.schema_ok else 'MISMATCH'}")
+    else:
+        print("  schema:      n/a (no schema recorded)")
+    print(f"  expected:    {res.expected_hash}")
+    print(f"  actual:      {res.actual_hash or '(file missing)'}")
+    return 0 if res.ok else 1
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Write a full lineage report: provenance, downstream, verification."""
+    store = open_store(args)
+    try:
+        ds = store.resolve(args.ref)
+    except LineageError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    files: Dict[str, str] = {}
+    if args.file_map:
+        try:
+            files = json.loads(Path(args.file_map).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"error: cannot read file map: {e}", file=sys.stderr)
+            return 1
+    rep = report_mod.lineage_report(store, ds.id, files)
+    text = rep.to_markdown() if args.format == "markdown" else rep.to_json()
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    bad = [v for v in rep.verifications if not v.ok]
+    if bad:
+        print(f"\nwarning: {len(bad)} verification failure(s)", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_dump(args: argparse.Namespace) -> int:
+    store = open_store(args)
+    summary = store.export_json(args.out)
+    print(f"wrote {args.out}: {summary['datasets']} datasets, "
+          f"{summary['transforms']} transforms")
+    return 0
+
+
+def cmd_load(args: argparse.Namespace) -> int:
+    store = open_store(args)
+    try:
+        summary = store.import_json(args.infile)
+    except LineageError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"imported from {args.infile}: {summary['datasets']} datasets, "
+          f"{summary['transforms']} transforms, {summary['skipped']} skipped")
+    return 0
+
+
 # -------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -247,6 +318,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("stats", help="show store statistics")
     st.set_defaults(func=cmd_stats)
+
+    v = sub.add_parser("verify", help="verify a file against the recorded hash")
+    v.add_argument("ref", help="dataset ref")
+    v.add_argument("--file", required=True, help="file on disk to verify")
+    v.set_defaults(func=cmd_verify)
+
+    rp = sub.add_parser("report", help="full lineage report: provenance, "
+                        "downstream, hash verification")
+    rp.add_argument("ref", help="dataset ref")
+    rp.add_argument("--file-map", default=None,
+                    help="JSON mapping of dataset refs to files on disk, "
+                         "e.g. '{\"raw\": \"data/raw.csv\"}'")
+    rp.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    rp.add_argument("--out", default=None, help="write to file instead of stdout")
+    rp.set_defaults(func=cmd_report)
+
+    dp = sub.add_parser("dump", help="write the whole store to a JSON backup file")
+    dp.add_argument("--out", required=True, help="output JSON file")
+    dp.set_defaults(func=cmd_dump)
+
+    lp = sub.add_parser("load", help="load a JSON backup file into the store")
+    lp.add_argument("--in", dest="infile", required=True, help="input JSON file")
+    lp.set_defaults(func=cmd_load)
     return p
 
 
