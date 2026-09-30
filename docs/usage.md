@@ -49,9 +49,24 @@ dlt lineage events_model_ready
 # 5. Ask "where did this dataset go?"
 dlt downstream raw_events
 
-# 6. Export the graph
+# 6. Verify the files on disk still match the recorded hashes
+dlt verify events_model_ready --file data/events_model_ready.csv
+
+# 7. Write a full audit report (provenance + downstream + verification)
+cat > files.json <<'EOF'
+{"raw_events": "data/events.csv",
+ "events_clean": "data/events_clean.csv",
+ "events_model_ready": "data/events_model_ready.csv"}
+EOF
+dlt report events_model_ready --file-map files.json --out report.md
+
+# 8. Export the graph
 dlt export --format dot --out lineage.dot      # render with: dot -Tpng lineage.dot -o lineage.png
 dlt export events_model_ready --format json    # subgraph as JSON
+
+# 9. Back up the whole store as JSON
+dlt dump --out lineage-backup.json
+dlt --db /tmp/restore.db load --in lineage-backup.json   # restore anywhere
 ```
 
 Typical `dlt lineage` output:
@@ -68,12 +83,28 @@ raw_events@v1 (a1b2c3d4) [1200000 rows x 8 cols]
 State lives in one SQLite file: `$LINEAGE_DB`, `--db <path>`, or
 `~/.data-lineage-tracker/lineage.db` by default. Copy the file to share a
 lineage log; it has no server and no dependencies beyond the standard
-library.
+library. For a portable, diffable backup use `dlt dump` / `dlt load`
+(see the README).
+
+## Hash verification
+
+Hashes are only useful if someone checks them. Before a training run or an
+audit, verify the files on disk against what registration recorded:
+
+```bash
+dlt verify events_clean --file data/events_clean.csv
+```
+
+Exit code is 0 when the content hash (and schema fingerprint, for CSVs)
+matches, 1 otherwise. `dlt report` runs verification for every node in the
+chain at once when given a `--file-map` of dataset refs to files.
 
 ## Python API
 
 ```python
-from data_lineage_tracker import LineageStore, graph
+from data_lineage_tracker import (
+    LineageStore, graph, lineage_report, verify_dataset,
+)
 
 with LineageStore("lineage.db") as store:
     raw = store.register_file("raw_events", "data/events.csv")
@@ -84,6 +115,15 @@ with LineageStore("lineage.db") as store:
     print(graph.format_chain(chain))
     dot = graph.to_dot(store)                          # GraphViz
     js = graph.to_json(store, clean.id)                # JSON subgraph
+
+    res = verify_dataset(store, clean.id, "data/events_clean.csv")
+    print(res.status)  # ok | hash_mismatch | schema_mismatch | file_missing
+
+    rep = lineage_report(store, clean.id,
+                         files={"raw_events": "data/events.csv",
+                                "events_clean": "data/events_clean.csv"})
+    print(rep.to_markdown())  # or rep.to_json()
+    store.export_json("lineage-backup.json")  # portable backup
 ```
 
 ## Good practices
