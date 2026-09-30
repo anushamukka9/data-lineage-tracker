@@ -311,3 +311,93 @@ class LineageStore:
         d = self._conn.execute("SELECT COUNT(*) FROM datasets").fetchone()[0]
         t = self._conn.execute("SELECT COUNT(*) FROM transforms").fetchone()[0]
         return {"datasets": d, "transforms": t}
+
+    # -------------------------------------------------------- json dump/load
+    def export_json(self, path: str | Path) -> Dict[str, int]:
+        """Write the whole store (datasets + transforms) to a JSON file.
+
+        A portable backup: the file can be loaded into a fresh store with
+        :meth:`import_json`. Returns a summary of what was written.
+        """
+        path = Path(path)
+        datasets = [d.to_dict() for d in self.list_datasets()]
+        transforms: List[Dict[str, Any]] = []
+        seen = set()
+        for d in self.list_datasets():
+            for t in self.children(d.id) + self.parents(d.id):
+                if t.id not in seen:
+                    seen.add(t.id)
+                    transforms.append(t.to_dict())
+        path.write_text(
+            json.dumps(
+                {"datasets": datasets, "transforms": transforms}, indent=2
+            ),
+            encoding="utf-8",
+        )
+        return {"datasets": len(datasets), "transforms": len(transforms)}
+
+    def import_json(self, path: str | Path) -> Dict[str, int]:
+        """Load a JSON dump written by :meth:`export_json` into this store.
+
+        Idempotent: nodes and edges already present with identical content
+        are skipped. Raises :class:`LineageError` if an id already exists
+        with *different* content (an honest conflict, never silently
+        overwritten) or if a transform references unknown datasets.
+        """
+        from .models import DatasetVersion, Transform
+
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        added = {"datasets": 0, "transforms": 0, "skipped": 0}
+        for d in data.get("datasets", []):
+            ds = DatasetVersion.from_dict(d)
+            existing = self._conn.execute(
+                "SELECT * FROM datasets WHERE id = ?", (ds.id,)
+            ).fetchone()
+            if existing:
+                if self._row_to_dataset(existing).to_dict() == ds.to_dict():
+                    added["skipped"] += 1
+                else:
+                    raise LineageError(
+                        f"conflicting dataset id on import: {ds.id[:8]}"
+                    )
+                continue
+            self._conn.execute(
+                """INSERT INTO datasets
+                   (id, name, version, content_hash, rows, cols,
+                    schema_fingerprint, source_uri, created_at, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ds.id, ds.name, ds.version, ds.content_hash, ds.rows,
+                    ds.cols, ds.schema_fingerprint, ds.source_uri,
+                    ds.created_at, json.dumps(ds.metadata),
+                ),
+            )
+            added["datasets"] += 1
+        for t in data.get("transforms", []):
+            tr = Transform.from_dict(t)
+            existing = self._conn.execute(
+                "SELECT * FROM transforms WHERE id = ?", (tr.id,)
+            ).fetchone()
+            if existing:
+                if self._row_to_transform(existing).to_dict() == tr.to_dict():
+                    added["skipped"] += 1
+                else:
+                    raise LineageError(
+                        f"conflicting transform id on import: {tr.id[:8]}"
+                    )
+                continue
+            try:
+                self._conn.execute(
+                    """INSERT INTO transforms
+                       (id, parent_id, child_id, op, params, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        tr.id, tr.parent_id, tr.child_id, tr.op,
+                        json.dumps(tr.params), tr.created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as e:
+                raise LineageError(f"cannot import transform: {e}") from e
+            added["transforms"] += 1
+        self._conn.commit()
+        return added
